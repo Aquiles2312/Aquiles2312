@@ -1,10 +1,33 @@
 /**
  * @file    qtr_sensors.h
- * @brief   STM32F411RE pure C port of the Pololu QTR8A reflectance sensor library.
+ * @brief   STM32F411RE QTR8A reflectance sensor library using ADC + DMA.
  *
- * Removed all Arduino dependencies; uses STM32 HAL ADC for analog readings.
- * Supports 8 analog sensors (QTR8A), calibration, line-position calculation,
- * and optional emitter (IR LED) control via a GPIO pin.
+ * Data acquisition is fully hardware-driven: the ADC scans all channels in
+ * sequence while the DMA transfers results into a user-supplied buffer.
+ * The library reads from that buffer instead of polling the ADC sensor by
+ * sensor, giving simultaneous captures and zero CPU overhead during conversion.
+ *
+ * Prerequisites (configure in STM32CubeMX before using this library):
+ *   - ADC: Scan Conversion Mode ENABLED
+ *   - ADC: Continuous Conversion Mode ENABLED (recommended)
+ *   - ADC: DMA Continuous Requests ENABLED
+ *   - DMA:  circular mode, half-word (16-bit) transfers
+ *
+ * Usage:
+ * @code
+ *   uint16_t adc_buffer[8];
+ *   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, 8);
+ *
+ *   QTRSensors qtr = {
+ *       .hadc         = &hadc1,
+ *       .adcBuffer    = adc_buffer,
+ *       .sensorCount  = 8,
+ *       .emitterGpioPort = GPIOA,
+ *       .emitterGpioPin  = GPIO_PIN_5,
+ *       .emitterOnState  = GPIO_PIN_SET,
+ *   };
+ *   QTRSensors_init(&qtr);
+ * @endcode
  */
 
 #ifndef QTR_SENSORS_H
@@ -25,10 +48,10 @@ extern "C" {
 /** Maximum number of sensors supported. */
 #define QTR_MAX_SENSORS        8U
 
-/** Raw ADC value for a 12-bit STM32 ADC (0-4095). */
+/** Maximum raw value from a 12-bit STM32 ADC (0-4095). */
 #define QTR_ADC_MAX            4095U
 
-/** Number of calibration readings taken per sensor per call. */
+/** Number of DMA buffer snapshots taken per calibration call. */
 #define QTR_CALIBRATION_READS  10U
 
 /** Scale for calibrated sensor output (0-1000). */
@@ -39,9 +62,7 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief Sensor type.
- *
- * Only analogue (RC or A-type) is relevant here; kept for API compatibility.
+ * @brief Sensor type (kept for API compatibility).
  */
 typedef enum {
     QTRTypeUndefined = 0,
@@ -50,21 +71,21 @@ typedef enum {
 } QTRType;
 
 /**
- * @brief Which emitters to use when taking a reading.
+ * @brief Emitter state for a reading.
  */
 typedef enum {
-    QTREmittersOff  = 0, /**< All emitters off. */
-    QTREmittersOn   = 1, /**< All emitters on.  */
-    QTREmittersSingle    /**< Only the emitter for the current sensor on (not supported). */
+    QTREmittersOff    = 0, /**< All emitters off. */
+    QTREmittersOn     = 1, /**< All emitters on.  */
+    QTREmittersSingle = 2  /**< Per-sensor emitter (not supported). */
 } QTREmitters;
 
 /**
- * @brief Read mode – controls emitter state during measurement.
+ * @brief Read mode - controls emitter state during measurement.
  */
 typedef enum {
-    QTRReadModeOff,       /**< Measure with emitters off (ambient light). */
-    QTRReadModeOn,        /**< Measure with emitters on only. */
-    QTRReadModeOnAndOff   /**< Measure with emitters on, subtract ambient reading. */
+    QTRReadModeOff,       /**< Snapshot with emitters off (ambient light). */
+    QTRReadModeOn,        /**< Snapshot with emitters on. */
+    QTRReadModeOnAndOff   /**< Snapshot on, then off; ambient is subtracted. */
 } QTRReadMode;
 
 /* ------------------------------------------------------------------ */
@@ -72,47 +93,52 @@ typedef enum {
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief Calibration data for one sensor array (min/max arrays).
+ * @brief Per-sensor min/max calibration data.
  */
 typedef struct {
-    uint16_t *minimum; /**< Per-sensor minimum raw value seen during calibration. */
-    uint16_t *maximum; /**< Per-sensor maximum raw value seen during calibration. */
-    uint8_t   count;   /**< Number of sensors this data covers. */
-    uint8_t   initialized; /**< Non-zero if arrays have been allocated. */
+    uint16_t *minimum;     /**< Per-sensor minimum raw value (from DMA buffer). */
+    uint16_t *maximum;     /**< Per-sensor maximum raw value (from DMA buffer). */
+    uint8_t   count;       /**< Number of sensors covered by this data. */
+    uint8_t   initialized; /**< Non-zero when arrays are allocated and seeded. */
 } CalibrationData;
-
-/**
- * @brief ADC channel descriptor – one entry per physical sensor.
- */
-typedef struct {
-    ADC_HandleTypeDef *hadc;    /**< Pointer to the HAL ADC handle for this sensor. */
-    uint32_t           channel; /**< ADC channel number (e.g. ADC_CHANNEL_0). */
-    uint32_t           rank;    /**< Conversion rank (1-based, for regular group). */
-} QTRSensorChannel;
 
 /**
  * @brief Main QTR sensor array descriptor.
  *
- * Populate the public fields before calling QTRSensors_init().
+ * Populate the public fields, then call QTRSensors_init().
+ * The ADC must already be running in DMA mode before calling any read
+ * function (start it with HAL_ADC_Start_DMA() in your application).
  */
 typedef struct {
-    /* --- Public configuration (fill before calling QTRSensors_init) --- */
-    QTRSensorChannel channels[QTR_MAX_SENSORS]; /**< ADC channel descriptors. */
-    uint8_t          sensorCount;               /**< Number of active sensors (1-8). */
+    /* --- Public configuration (set before QTRSensors_init) ---------- */
 
-    /** Optional emitter enable pin. Set gpioPort to NULL to disable. */
-    GPIO_TypeDef    *emitterGpioPort;
-    uint16_t         emitterGpioPin;
-    GPIO_PinState    emitterOnState; /**< State that turns emitters ON. */
+    /**
+     * HAL ADC handle whose DMA is filling adcBuffer.
+     * Used only for HAL_ADC_Start_DMA() restart if needed; the library
+     * does NOT reconfigure channels or ranks - that is CubeMX's job.
+     */
+    ADC_HandleTypeDef *hadc;
 
-    uint8_t          samplesPerSensor; /**< ADC readings averaged per sensor (>=1). */
-    QTRType          type;             /**< Sensor type (should be QTRTypeAnalog). */
+    /**
+     * Pointer to the DMA destination buffer supplied to HAL_ADC_Start_DMA().
+     * Buffer length must be >= sensorCount.
+     * The order of entries MUST match the ADC scan rank order set in CubeMX.
+     */
+    volatile uint16_t *adcBuffer;
 
-    /* --- Private runtime state (managed by library) --- */
-    CalibrationData  calibrationOn;  /**< Calibration taken with emitters on. */
-    CalibrationData  calibrationOff; /**< Calibration taken with emitters off. */
+    uint8_t           sensorCount;     /**< Number of active sensors (1-8). */
 
-    int32_t          _lastPosition;  /**< Last valid line position (for lost-line recovery). */
+    /** Optional emitter enable GPIO. Set to NULL to disable emitter control. */
+    GPIO_TypeDef     *emitterGpioPort;
+    uint16_t          emitterGpioPin;
+    GPIO_PinState     emitterOnState;  /**< GPIO state that turns emitters ON. */
+
+    QTRType           type;            /**< Sensor type (QTRTypeAnalog). */
+
+    /* --- Private runtime state (managed by library) ----------------- */
+    CalibrationData   calibrationOn;   /**< Calibration with emitters on. */
+    CalibrationData   calibrationOff;  /**< Calibration with emitters off. */
+    int32_t           _lastPosition;   /**< Last valid line position (recovery). */
 } QTRSensors;
 
 /* ------------------------------------------------------------------ */
@@ -120,47 +146,44 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief  Initialise the QTR sensor library for a given sensor array.
+ * @brief  Initialise the library and allocate calibration arrays.
  *
- * Allocates calibration arrays.  Call QTRSensors_deinit() to free memory.
+ * Call QTRSensors_deinit() when done to release memory.
  *
- * @param  qtr  Pointer to a user-allocated QTRSensors structure that has
- *              already had its public fields populated.
+ * @param  qtr  Descriptor with public fields already populated.
  */
 void QTRSensors_init(QTRSensors *qtr);
 
 /**
- * @brief  Free calibration memory and reset the structure.
- * @param  qtr  Pointer to an initialised QTRSensors structure.
+ * @brief  Free calibration memory and reset runtime state.
+ * @param  qtr  Initialised descriptor.
  */
 void QTRSensors_deinit(QTRSensors *qtr);
 
 /**
- * @brief  Reset (erase) calibration data so the next calibrate call starts fresh.
- * @param  qtr  Pointer to an initialised QTRSensors structure.
+ * @brief  Erase calibration so the next calibrate call starts fresh.
+ * @param  qtr  Initialised descriptor.
  */
 void QTRSensors_resetCalibration(QTRSensors *qtr);
 
 /* --- Raw readings -------------------------------------------------- */
 
 /**
- * @brief  Read raw ADC values from all sensors.
+ * @brief  Copy the current DMA buffer snapshot into @p values.
  *
- * Results are 12-bit values (0 – 4095).  Averages samplesPerSensor readings.
- *
- * @param  qtr      Pointer to an initialised QTRSensors structure.
- * @param  values   Output buffer; caller must provide at least sensorCount entries.
- * @param  emitters Which emitters to enable during the measurement.
+ * @param  qtr      Initialised descriptor.
+ * @param  values   Output buffer; caller provides >= sensorCount entries.
+ * @param  emitters Emitter state to set before snapshotting.
  */
 void QTRSensors_readRaw(QTRSensors *qtr, uint16_t *values, QTREmitters emitters);
 
 /**
- * @brief  Read raw values according to the chosen read mode.
+ * @brief  Snapshot the DMA buffer according to the chosen read mode.
  *
- * For QTRReadModeOnAndOff the ambient (off) reading is subtracted from the
- * lit (on) reading; any underflow is clamped to 0.
+ * For QTRReadModeOnAndOff the ambient (off) snapshot is subtracted from
+ * the lit (on) snapshot; underflow is clamped to 0.
  *
- * @param  qtr    Pointer to an initialised QTRSensors structure.
+ * @param  qtr    Initialised descriptor.
  * @param  values Output buffer (sensorCount entries).
  * @param  mode   Read mode.
  */
@@ -169,26 +192,26 @@ void QTRSensors_read(QTRSensors *qtr, uint16_t *values, QTRReadMode mode);
 /* --- Calibration --------------------------------------------------- */
 
 /**
- * @brief  Perform one calibration pass (call repeatedly ~250 ms).
+ * @brief  Perform one calibration pass.
  *
- * Reads QTR_CALIBRATION_READS samples per sensor and updates the stored
- * minimum/maximum for both the On and Off measurements.
+ * Takes QTR_CALIBRATION_READS snapshots from the DMA buffer and updates
+ * the stored per-sensor min/max values.  Call repeatedly while sweeping
+ * the sensor array over the surface (~250 ms total recommended).
  *
- * @param  qtr   Pointer to an initialised QTRSensors structure.
- * @param  mode  Read mode used during calibration.
+ * @param  qtr   Initialised descriptor.
+ * @param  mode  Read mode to use during calibration.
  */
 void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode);
 
 /**
- * @brief  Read calibrated values in the range [0, 1000].
+ * @brief  Read calibrated values scaled to [0, 1000].
  *
- * A value of 0 means the sensor is above the lightest surface seen during
- * calibration; 1000 means darkest.
+ * 0 = lightest surface seen during calibration; 1000 = darkest.
  *
- * @param  qtr    Pointer to an initialised QTRSensors structure.
+ * @param  qtr    Initialised descriptor.
  * @param  values Output buffer (sensorCount entries).
  * @param  mode   Read mode (must match the mode used during calibration).
- * @return 0 on success, -1 if not calibrated.
+ * @return 0 on success, -1 if calibration data is missing.
  */
 int  QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mode);
 
@@ -197,16 +220,15 @@ int  QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mo
 /**
  * @brief  Return the position of a black line on a white background.
  *
- * Uses a weighted average of calibrated sensor values.
- * Result ranges from 0 (line under sensor 0) to (sensorCount-1)*1000
- * (line under the last sensor).
+ * Weighted average of calibrated values.
+ * Range: 0 (line under sensor 0) to (sensorCount-1)*1000 (last sensor).
  *
- * @param  qtr          Pointer to an initialised QTRSensors structure.
- * @param  values       Calibrated values buffer (filled by this function).
+ * @param  qtr          Initialised descriptor.
+ * @param  values       Buffer filled with calibrated readings (sensorCount entries).
  * @param  mode         Read mode.
- * @param  whiteThresh  Sensors above this calibrated value are ignored
- *                      (typically 500).
- * @return Line position, or -1 if all sensors read below whiteThresh.
+ * @param  whiteThresh  Sensors with calibrated value below this threshold are
+ *                      excluded (typically 500).
+ * @return Line position, or -1 if calibration data is missing.
  */
 int32_t QTRSensors_readLineBlack(QTRSensors *qtr, uint16_t *values,
                                  QTRReadMode mode, uint16_t whiteThresh);
@@ -214,14 +236,14 @@ int32_t QTRSensors_readLineBlack(QTRSensors *qtr, uint16_t *values,
 /**
  * @brief  Return the position of a white line on a black background.
  *
- * Inverts the calibrated sensor readings before computing position.
+ * Inverts calibrated readings before computing the weighted average.
  *
- * @param  qtr          Pointer to an initialised QTRSensors structure.
- * @param  values       Calibrated values buffer (filled by this function).
+ * @param  qtr          Initialised descriptor.
+ * @param  values       Buffer filled with calibrated readings (sensorCount entries).
  * @param  mode         Read mode.
- * @param  blackThresh  Sensors below this calibrated value are ignored
- *                      (typically 500).
- * @return Line position, or -1 if all sensors read above blackThresh.
+ * @param  blackThresh  Sensors with inverted calibrated value below this
+ *                      threshold are excluded (typically 500).
+ * @return Line position, or -1 if calibration data is missing.
  */
 int32_t QTRSensors_readLineWhite(QTRSensors *qtr, uint16_t *values,
                                  QTRReadMode mode, uint16_t blackThresh);
@@ -229,11 +251,11 @@ int32_t QTRSensors_readLineWhite(QTRSensors *qtr, uint16_t *values,
 /* --- Emitter control ----------------------------------------------- */
 
 /**
- * @brief  Turn the IR emitters on or off via the configured GPIO pin.
+ * @brief  Drive the emitter GPIO pin on or off.
  *
- * Does nothing if emitterGpioPort is NULL.
+ * Does nothing when emitterGpioPort is NULL.
  *
- * @param  qtr      Pointer to an initialised QTRSensors structure.
+ * @param  qtr      Initialised descriptor.
  * @param  emitters QTREmittersOn or QTREmittersOff.
  */
 void QTRSensors_setEmitters(QTRSensors *qtr, QTREmitters emitters);

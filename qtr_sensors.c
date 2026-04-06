@@ -1,10 +1,16 @@
 /**
  * @file    qtr_sensors.c
- * @brief   STM32F411RE pure C port of the Pololu QTR8A reflectance sensor library.
+ * @brief   STM32F411RE QTR8A reflectance sensor library using ADC + DMA.
  *
- * All Arduino-specific APIs have been replaced with STM32 HAL equivalents.
- * ADC conversions use HAL_ADC_PollForConversion(); emitter control uses a
- * standard HAL GPIO write.
+ * Data acquisition is hardware-driven: the ADC scans all channels in scan
+ * mode while the DMA writes results into a circular buffer supplied by the
+ * application.  The library reads snapshots from that buffer instead of
+ * polling each ADC channel sequentially, giving true simultaneous captures
+ * with minimal CPU involvement.
+ *
+ * The application is responsible for calling HAL_ADC_Start_DMA() before
+ * using any read function.  This library does not reconfigure ADC channels
+ * or ranks - that is done once by CubeMX-generated code.
  */
 
 #include "qtr_sensors.h"
@@ -20,9 +26,9 @@
 /**
  * @brief Allocate (or re-allocate) the min/max arrays inside a CalibrationData.
  *
- * Safe to call multiple times – frees existing arrays before re-allocating.
+ * Safe to call multiple times: frees existing arrays before re-allocating.
  *
- * @param  cal   Pointer to CalibrationData to initialise.
+ * @param  cal   CalibrationData to initialise.
  * @param  count Number of sensors.
  */
 static void _calibration_init(CalibrationData *cal, uint8_t count)
@@ -37,14 +43,14 @@ static void _calibration_init(CalibrationData *cal, uint8_t count)
     cal->count   = count;
 
     if (cal->minimum && cal->maximum) {
-        /* Seed min with the largest possible value, max with 0. */
-        for (uint8_t i = 0; i < count; i++) {
+        /* Seed min with the highest possible raw value, max with 0. */
+        for (uint8_t i = 0U; i < count; i++) {
             cal->minimum[i] = QTR_ADC_MAX;
             cal->maximum[i] = 0U;
         }
         cal->initialized = 1U;
     } else {
-        /* Allocation failure – free whatever succeeded and mark uninitialised. */
+        /* Allocation failure: free whatever succeeded and mark uninitialised. */
         free(cal->minimum);
         free(cal->maximum);
         cal->minimum     = NULL;
@@ -55,7 +61,7 @@ static void _calibration_init(CalibrationData *cal, uint8_t count)
 
 /**
  * @brief Free the arrays inside a CalibrationData and reset it.
- * @param  cal  Pointer to CalibrationData to free.
+ * @param  cal  CalibrationData to free.
  */
 static void _calibration_free(CalibrationData *cal)
 {
@@ -70,62 +76,55 @@ static void _calibration_free(CalibrationData *cal)
 }
 
 /**
- * @brief Read a single ADC sample from one sensor channel.
+ * @brief Copy a snapshot of the DMA buffer into @p values.
  *
- * Configures the ADC channel for a regular conversion, starts, polls for
- * completion, and returns the raw 12-bit result.
+ * The ADC + DMA fills adcBuffer continuously in circular mode.  Each entry is
+ * read with a single 16-bit load instruction, which is naturally atomic on
+ * Cortex-M4 when the buffer is half-word aligned (guaranteed by the DMA
+ * peripheral and standard C alignment rules for uint16_t arrays).  A
+ * torn-read of a single sample would only introduce one stale ADC value for
+ * one sensor per snapshot, which the calibration and weighted-average
+ * algorithms tolerate.  If stricter consistency is required, disable the DMA
+ * interrupt (HAL_ADC_Stop_DMA / HAL_ADC_Start_DMA) around this copy.
  *
- * @param  ch  Pointer to the QTRSensorChannel descriptor.
- * @return 12-bit ADC result (0 – 4095), or 0 on timeout.
+ * @param  qtr    Sensor array descriptor.
+ * @param  values Output buffer (sensorCount entries).
  */
-static uint16_t _read_adc_channel(const QTRSensorChannel *ch)
+static void _snapshot_dma_buffer(const QTRSensors *qtr, uint16_t *values)
 {
-    ADC_ChannelConfTypeDef cfg = {0};
-    cfg.Channel      = ch->channel;
-    cfg.Rank         = ch->rank;
-    cfg.SamplingTime = ADC_SAMPLETIME_84CYCLES; /* ~3 us at 84 MHz ADCCLK */
-
-    if (HAL_ADC_ConfigChannel(ch->hadc, &cfg) != HAL_OK) {
-        return 0U;
+    for (uint8_t i = 0U; i < qtr->sensorCount; i++) {
+        values[i] = qtr->adcBuffer[i];
     }
-
-    HAL_ADC_Start(ch->hadc);
-    if (HAL_ADC_PollForConversion(ch->hadc, 10U) != HAL_OK) {
-        HAL_ADC_Stop(ch->hadc);
-        return 0U;
-    }
-
-    uint16_t value = (uint16_t)HAL_ADC_GetValue(ch->hadc);
-    HAL_ADC_Stop(ch->hadc);
-    return value;
 }
 
 /**
- * @brief Read raw ADC values for all sensors using the given emitter state.
- *
- * Averages samplesPerSensor readings and stores results in @p values.
+ * @brief Set emitters, snapshot the DMA buffer, copy to @p values.
  *
  * @param  qtr      Sensor array descriptor.
  * @param  values   Output buffer (sensorCount entries).
- * @param  emitters Emitter state to use during the measurement.
+ * @param  emitters Emitter state to apply before snapshotting.
  */
 static void _read_private(QTRSensors *qtr, uint16_t *values, QTREmitters emitters)
 {
     QTRSensors_setEmitters(qtr, emitters);
 
-    uint8_t samples = (qtr->samplesPerSensor > 0U) ? qtr->samplesPerSensor : 1U;
-
-    for (uint8_t s = 0U; s < qtr->sensorCount; s++) {
-        uint32_t sum = 0U;
-        for (uint8_t n = 0U; n < samples; n++) {
-            sum += _read_adc_channel(&qtr->channels[s]);
-        }
-        values[s] = (uint16_t)(sum / samples);
+    /*
+     * Allow the IR emitters to settle before snapshotting.  The QTR8A
+     * datasheet specifies a maximum emitter rise time of ~200 us.  A 1 ms
+     * guard covers that comfortably while keeping the per-snapshot overhead
+     * manageable.  If the application uses a faster control loop, reduce
+     * this to HAL_Delay(0) (no wait) after confirming emitter settling on
+     * your hardware.
+     */
+    if (emitters == QTREmittersOn && qtr->emitterGpioPort != NULL) {
+        HAL_Delay(1U);
     }
+
+    _snapshot_dma_buffer(qtr, values);
 }
 
 /* ================================================================== */
-/* Public API – initialisation                                          */
+/* Public API - initialisation                                          */
 /* ================================================================== */
 
 void QTRSensors_init(QTRSensors *qtr)
@@ -134,13 +133,9 @@ void QTRSensors_init(QTRSensors *qtr)
         return;
     }
 
-    /* Clamp sensor count. */
+    /* Clamp sensor count to valid range. */
     if (qtr->sensorCount == 0U || qtr->sensorCount > QTR_MAX_SENSORS) {
         qtr->sensorCount = QTR_MAX_SENSORS;
-    }
-
-    if (qtr->samplesPerSensor == 0U) {
-        qtr->samplesPerSensor = 1U;
     }
 
     /* Initialise calibration structures. */
@@ -171,12 +166,12 @@ void QTRSensors_resetCalibration(QTRSensors *qtr)
 }
 
 /* ================================================================== */
-/* Public API – raw readings                                            */
+/* Public API - raw readings                                            */
 /* ================================================================== */
 
 void QTRSensors_readRaw(QTRSensors *qtr, uint16_t *values, QTREmitters emitters)
 {
-    if (qtr == NULL || values == NULL) {
+    if (qtr == NULL || values == NULL || qtr->adcBuffer == NULL) {
         return;
     }
     _read_private(qtr, values, emitters);
@@ -185,7 +180,7 @@ void QTRSensors_readRaw(QTRSensors *qtr, uint16_t *values, QTREmitters emitters)
 
 void QTRSensors_read(QTRSensors *qtr, uint16_t *values, QTRReadMode mode)
 {
-    if (qtr == NULL || values == NULL) {
+    if (qtr == NULL || values == NULL || qtr->adcBuffer == NULL) {
         return;
     }
 
@@ -201,11 +196,11 @@ void QTRSensors_read(QTRSensors *qtr, uint16_t *values, QTRReadMode mode)
         case QTRReadModeOnAndOff: {
             uint16_t valuesOff[QTR_MAX_SENSORS] = {0};
 
-            /* Read with emitters on, then off. */
+            /* Snapshot with emitters on, then off. */
             _read_private(qtr, values,    QTREmittersOn);
             _read_private(qtr, valuesOff, QTREmittersOff);
 
-            /* Subtract ambient; clamp to 0. */
+            /* Subtract ambient; clamp underflow to 0. */
             for (uint8_t i = 0U; i < qtr->sensorCount; i++) {
                 if (values[i] > valuesOff[i]) {
                     values[i] = values[i] - valuesOff[i];
@@ -224,12 +219,12 @@ void QTRSensors_read(QTRSensors *qtr, uint16_t *values, QTRReadMode mode)
 }
 
 /* ================================================================== */
-/* Public API – calibration                                             */
+/* Public API - calibration                                             */
 /* ================================================================== */
 
 void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode)
 {
-    if (qtr == NULL) {
+    if (qtr == NULL || qtr->adcBuffer == NULL) {
         return;
     }
 
@@ -238,12 +233,11 @@ void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode)
 
     for (uint8_t r = 0U; r < QTR_CALIBRATION_READS; r++) {
         if (mode == QTRReadModeOnAndOff) {
-            /* Capture both states in one pass. */
             uint16_t tmp[QTR_MAX_SENSORS] = {0};
             _read_private(qtr, tmp,       QTREmittersOn);
             _read_private(qtr, valuesOff, QTREmittersOff);
 
-            /* Subtract ambient. */
+            /* Subtract ambient per sensor. */
             for (uint8_t i = 0U; i < qtr->sensorCount; i++) {
                 valuesOn[i] = (tmp[i] > valuesOff[i]) ? (tmp[i] - valuesOff[i]) : 0U;
             }
@@ -253,7 +247,7 @@ void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode)
             _read_private(qtr, valuesOff, QTREmittersOff);
         }
 
-        /* Update On calibration data. */
+        /* Update On calibration. */
         if (mode != QTRReadModeOff && qtr->calibrationOn.initialized) {
             for (uint8_t i = 0U; i < qtr->sensorCount; i++) {
                 if (valuesOn[i] < qtr->calibrationOn.minimum[i]) {
@@ -265,7 +259,7 @@ void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode)
             }
         }
 
-        /* Update Off calibration data. */
+        /* Update Off calibration. */
         if (mode != QTRReadModeOn && qtr->calibrationOff.initialized) {
             for (uint8_t i = 0U; i < qtr->sensorCount; i++) {
                 if (valuesOff[i] < qtr->calibrationOff.minimum[i]) {
@@ -282,7 +276,7 @@ void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode)
 }
 
 /* ================================================================== */
-/* Public API – calibrated readings                                     */
+/* Public API - calibrated readings                                     */
 /* ================================================================== */
 
 int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mode)
@@ -298,7 +292,7 @@ int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mod
         return -1;
     }
 
-    /* Get raw / compensated reading. */
+    /* Get the current DMA-based snapshot. */
     uint16_t raw[QTR_MAX_SENSORS] = {0};
     QTRSensors_read(qtr, raw, mode);
 
@@ -307,12 +301,12 @@ int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mod
         uint16_t calMax = cal->maximum[i];
 
         if (calMax <= calMin) {
-            /* No valid calibration range – output 0. */
+            /* No valid calibration range yet - output 0. */
             values[i] = 0U;
             continue;
         }
 
-        /* Map raw value into [0, QTR_CALIBRATED_MAX]. */
+        /* Linear map: raw value -> [0, QTR_CALIBRATED_MAX]. */
         int32_t norm;
         if (raw[i] <= calMin) {
             norm = 0;
@@ -330,19 +324,19 @@ int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mod
 }
 
 /* ================================================================== */
-/* Internal – line position engine                                      */
+/* Internal - line position engine                                      */
 /* ================================================================== */
 
 /**
  * @brief Compute weighted-average line position from calibrated values.
  *
- * @param  qtr           Sensor array descriptor.
- * @param  values        Calibrated sensor values [0, 1000].
- * @param  inverted      If non-zero, inverts values (white-line mode).
- * @param  threshold     Sensors whose (possibly inverted) value is below this
- *                       number are excluded from the average.
- * @return Position [0, (sensorCount-1)*1000], or the last valid position if
- *         no sensor exceeds the threshold.
+ * @param  qtr       Sensor array descriptor.
+ * @param  values    Calibrated sensor values [0, 1000].
+ * @param  inverted  Non-zero to invert values (white-line mode).
+ * @param  threshold Sensors whose (possibly inverted) value is at or below
+ *                   this threshold are excluded from the average.
+ * @return Position [0, (sensorCount-1)*1000], or last position if no sensor
+ *         exceeds the threshold (lost-line recovery).
  */
 static int32_t _read_line(QTRSensors *qtr, uint16_t *values,
                           uint8_t inverted, uint16_t threshold)
@@ -362,11 +356,8 @@ static int32_t _read_line(QTRSensors *qtr, uint16_t *values,
     }
 
     if (!onLine) {
-        /*
-         * No sensor detected the line.  Return the extreme position on the
-         * side the line was last seen (helps with line-following recovery).
-         */
-        if (qtr->_lastPosition < (int32_t)((qtr->sensorCount / 2) * QTR_CALIBRATED_MAX)) {
+        /* Return the edge on the side the line was last detected. */
+        if (qtr->_lastPosition < (int32_t)((qtr->sensorCount / 2U) * QTR_CALIBRATED_MAX)) {
             return 0;
         } else {
             return (int32_t)((qtr->sensorCount - 1U) * QTR_CALIBRATED_MAX);
@@ -379,7 +370,7 @@ static int32_t _read_line(QTRSensors *qtr, uint16_t *values,
 }
 
 /* ================================================================== */
-/* Public API – line position                                           */
+/* Public API - line position                                           */
 /* ================================================================== */
 
 int32_t QTRSensors_readLineBlack(QTRSensors *qtr, uint16_t *values,
@@ -407,7 +398,7 @@ int32_t QTRSensors_readLineWhite(QTRSensors *qtr, uint16_t *values,
 }
 
 /* ================================================================== */
-/* Public API – emitter control                                         */
+/* Public API - emitter control                                         */
 /* ================================================================== */
 
 void QTRSensors_setEmitters(QTRSensors *qtr, QTREmitters emitters)
