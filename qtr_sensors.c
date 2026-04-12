@@ -15,7 +15,6 @@
 
 #include "qtr_sensors.h"
 
-#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -31,48 +30,13 @@
  * @param  cal   CalibrationData to initialise.
  * @param  count Number of sensors.
  */
-static void _calibration_init(CalibrationData *cal, uint8_t count)
+static void _calibration_reset(CalibrationData *cal, uint8_t count)
 {
-    if (cal->initialized) {
-        free(cal->minimum);
-        free(cal->maximum);
+    for (uint8_t i = 0; i < count; i++) {
+        cal->minimum[i] = QTR_ADC_MAX;
+        cal->maximum[i] = 0U;
     }
-
-    cal->minimum = (uint16_t *)malloc(count * sizeof(uint16_t));
-    cal->maximum = (uint16_t *)malloc(count * sizeof(uint16_t));
-    cal->count   = count;
-
-    if (cal->minimum && cal->maximum) {
-        /* Seed min with the highest possible raw value, max with 0. */
-        for (uint8_t i = 0U; i < count; i++) {
-            cal->minimum[i] = QTR_ADC_MAX;
-            cal->maximum[i] = 0U;
-        }
-        cal->initialized = 1U;
-    } else {
-        /* Allocation failure: free whatever succeeded and mark uninitialised. */
-        free(cal->minimum);
-        free(cal->maximum);
-        cal->minimum     = NULL;
-        cal->maximum     = NULL;
-        cal->initialized = 0U;
-    }
-}
-
-/**
- * @brief Free the arrays inside a CalibrationData and reset it.
- * @param  cal  CalibrationData to free.
- */
-static void _calibration_free(CalibrationData *cal)
-{
-    if (cal->initialized) {
-        free(cal->minimum);
-        free(cal->maximum);
-        cal->minimum     = NULL;
-        cal->maximum     = NULL;
-        cal->count       = 0U;
-        cal->initialized = 0U;
-    }
+    cal->initialized = 1U;
 }
 
 /**
@@ -116,11 +80,24 @@ static void _read_private(QTRSensors *qtr, uint16_t *values, QTREmitters emitter
      * this to HAL_Delay(0) (no wait) after confirming emitter settling on
      * your hardware.
      */
-    if (emitters == QTREmittersOn && qtr->emitterGpioPort != NULL) {
-        HAL_Delay(1U);
+    
+    _snapshot_dma_buffer(qtr, values);
+}
+
+static void _apply_filter(QTRSensors *qtr, uint16_t *values)
+{
+    if (!qtr->filterInitialized) {
+        for (uint8_t i = 0; i < qtr->sensorCount; i++) {
+            qtr->filtered[i] = values[i];
+        }
+        qtr->filterInitialized = 1;
+        return;
     }
 
-    _snapshot_dma_buffer(qtr, values);
+    for (uint8_t i = 0; i < qtr->sensorCount; i++) {
+        qtr->filtered[i] = (qtr->filtered[i] * 3 + values[i]) >> 2;
+        values[i] = qtr->filtered[i];
+    }
 }
 
 /* ================================================================== */
@@ -141,19 +118,11 @@ void QTRSensors_init(QTRSensors *qtr)
     /* Initialise calibration structures. */
     memset(&qtr->calibrationOn,  0, sizeof(CalibrationData));
     memset(&qtr->calibrationOff, 0, sizeof(CalibrationData));
-    _calibration_init(&qtr->calibrationOn,  qtr->sensorCount);
-    _calibration_init(&qtr->calibrationOff, qtr->sensorCount);
+    _calibration_reset(&qtr->calibrationOn, qtr->sensorCount);
+    _calibration_reset(&qtr->calibrationOff, qtr->sensorCount);
 
-    qtr->_lastPosition = 0;
-}
-
-void QTRSensors_deinit(QTRSensors *qtr)
-{
-    if (qtr == NULL) {
-        return;
-    }
-    _calibration_free(&qtr->calibrationOn);
-    _calibration_free(&qtr->calibrationOff);
+    qtr->_lastPosition = (qtr->sensorCount - 1) * QTR_CALIBRATED_MAX / 2;
+    qtr->filterInitialized = 0;
 }
 
 void QTRSensors_resetCalibration(QTRSensors *qtr)
@@ -161,8 +130,8 @@ void QTRSensors_resetCalibration(QTRSensors *qtr)
     if (qtr == NULL) {
         return;
     }
-    _calibration_init(&qtr->calibrationOn,  qtr->sensorCount);
-    _calibration_init(&qtr->calibrationOff, qtr->sensorCount);
+    _calibration_reset(&qtr->calibrationOn,  qtr->sensorCount);
+    _calibration_reset(&qtr->calibrationOff, qtr->sensorCount);
 }
 
 /* ================================================================== */
@@ -215,6 +184,10 @@ void QTRSensors_read(QTRSensors *qtr, uint16_t *values, QTRReadMode mode)
             break;
     }
 
+if (!qtr->isCalibrating) {
+    _apply_filter(qtr, values);
+}
+
     QTRSensors_setEmitters(qtr, QTREmittersOff);
 }
 
@@ -227,6 +200,7 @@ void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode)
     if (qtr == NULL || qtr->adcBuffer == NULL) {
         return;
     }
+    qtr->isCalibrating = 1;
 
     uint16_t valuesOn[QTR_MAX_SENSORS]  = {0};
     uint16_t valuesOff[QTR_MAX_SENSORS] = {0};
@@ -273,6 +247,7 @@ void QTRSensors_calibrate(QTRSensors *qtr, QTRReadMode mode)
     }
 
     QTRSensors_setEmitters(qtr, QTREmittersOff);
+    qtr->isCalibrating = 0;
 }
 
 /* ================================================================== */
@@ -286,8 +261,7 @@ int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mod
     }
 
     /* Choose which calibration set to use. */
-    CalibrationData *cal = (mode == QTRReadModeOff) ? &qtr->calibrationOff
-                                                     : &qtr->calibrationOn;
+    CalibrationData *cal = (mode == QTRReadModeOff) ? &qtr->calibrationOff : &qtr->calibrationOn;
     if (!cal->initialized) {
         return -1;
     }
@@ -300,7 +274,7 @@ int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mod
         uint16_t calMin = cal->minimum[i];
         uint16_t calMax = cal->maximum[i];
 
-        if (calMax <= calMin) {
+        if ((calMax - calMin) < 10) {
             /* No valid calibration range yet - output 0. */
             values[i] = 0U;
             continue;
@@ -313,8 +287,7 @@ int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mod
         } else if (raw[i] >= calMax) {
             norm = (int32_t)QTR_CALIBRATED_MAX;
         } else {
-            norm = (int32_t)((uint32_t)(raw[i] - calMin) * QTR_CALIBRATED_MAX
-                             / (uint32_t)(calMax - calMin));
+            norm = (int32_t)((uint32_t)(raw[i] - calMin) * QTR_CALIBRATED_MAX / (uint32_t)(calMax - calMin));
         }
 
         values[i] = (uint16_t)norm;
@@ -338,29 +311,26 @@ int QTRSensors_readCalibrated(QTRSensors *qtr, uint16_t *values, QTRReadMode mod
  * @return Position [0, (sensorCount-1)*1000], or last position if no sensor
  *         exceeds the threshold (lost-line recovery).
  */
-static int32_t _read_line(QTRSensors *qtr, uint16_t *values,
-                          uint8_t inverted, uint16_t threshold)
+static int32_t _read_line(QTRSensors *qtr, uint16_t *values, uint8_t inverted, uint16_t threshold)
 {
     uint32_t avg    = 0U;
     uint32_t sum    = 0U;
-    uint8_t  onLine = 0U;
 
     for (uint8_t i = 0U; i < qtr->sensorCount; i++) {
         uint16_t v = inverted ? (QTR_CALIBRATED_MAX - values[i]) : values[i];
 
         if (v > threshold) {
-            onLine = 1U;
             avg += (uint32_t)v * (uint32_t)(i * QTR_CALIBRATED_MAX);
             sum += v;
         }
     }
 
-    if (!onLine) {
+    uint32_t linethreshold = (qtr->sensorCount * 50);
+
+    if (sum < linethreshold) {
         /* Return the edge on the side the line was last detected. */
         if (qtr->_lastPosition < (int32_t)((qtr->sensorCount / 2U) * QTR_CALIBRATED_MAX)) {
-            return 0;
-        } else {
-            return (int32_t)((qtr->sensorCount - 1U) * QTR_CALIBRATED_MAX);
+            return qtr->_lastPosition;
         }
     }
 
@@ -373,8 +343,7 @@ static int32_t _read_line(QTRSensors *qtr, uint16_t *values,
 /* Public API - line position                                           */
 /* ================================================================== */
 
-int32_t QTRSensors_readLineBlack(QTRSensors *qtr, uint16_t *values,
-                                 QTRReadMode mode, uint16_t whiteThresh)
+int32_t QTRSensors_readLineBlack(QTRSensors *qtr, uint16_t *values, QTRReadMode mode, uint16_t whiteThresh)
 {
     if (qtr == NULL || values == NULL) {
         return -1;
@@ -385,8 +354,7 @@ int32_t QTRSensors_readLineBlack(QTRSensors *qtr, uint16_t *values,
     return _read_line(qtr, values, 0U, whiteThresh);
 }
 
-int32_t QTRSensors_readLineWhite(QTRSensors *qtr, uint16_t *values,
-                                 QTRReadMode mode, uint16_t blackThresh)
+int32_t QTRSensors_readLineWhite(QTRSensors *qtr, uint16_t *values, QTRReadMode mode, uint16_t blackThresh)
 {
     if (qtr == NULL || values == NULL) {
         return -1;
@@ -408,11 +376,9 @@ void QTRSensors_setEmitters(QTRSensors *qtr, QTREmitters emitters)
     }
 
     if (emitters == QTREmittersOn) {
-        HAL_GPIO_WritePin(qtr->emitterGpioPort, qtr->emitterGpioPin,
-                          qtr->emitterOnState);
+        HAL_GPIO_WritePin(qtr->emitterGpioPort, qtr->emitterGpioPin, qtr->emitterOnState);
     } else {
-        GPIO_PinState offState = (qtr->emitterOnState == GPIO_PIN_SET)
-                                 ? GPIO_PIN_RESET : GPIO_PIN_SET;
+        GPIO_PinState offState = (qtr->emitterOnState == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
         HAL_GPIO_WritePin(qtr->emitterGpioPort, qtr->emitterGpioPin, offState);
     }
 }

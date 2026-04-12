@@ -96,10 +96,9 @@ typedef enum {
  * @brief Per-sensor min/max calibration data.
  */
 typedef struct {
-    uint16_t *minimum;     /**< Per-sensor minimum raw value (from DMA buffer). */
-    uint16_t *maximum;     /**< Per-sensor maximum raw value (from DMA buffer). */
-    uint8_t   count;       /**< Number of sensors covered by this data. */
-    uint8_t   initialized; /**< Non-zero when arrays are allocated and seeded. */
+    uint16_t minimum[QTR_MAX_SENSORS];
+    uint16_t maximum[QTR_MAX_SENSORS];
+    uint8_t  initialized;
 } CalibrationData;
 
 /**
@@ -117,7 +116,6 @@ typedef struct {
      * Used only for HAL_ADC_Start_DMA() restart if needed; the library
      * does NOT reconfigure channels or ranks - that is CubeMX's job.
      */
-    ADC_HandleTypeDef *hadc;
 
     /**
      * Pointer to the DMA destination buffer supplied to HAL_ADC_Start_DMA().
@@ -139,6 +137,10 @@ typedef struct {
     CalibrationData   calibrationOn;   /**< Calibration with emitters on. */
     CalibrationData   calibrationOff;  /**< Calibration with emitters off. */
     int32_t           _lastPosition;   /**< Last valid line position (recovery). */
+    uint16_t filtered[QTR_MAX_SENSORS];
+    uint8_t  filterInitialized;
+
+    uint8_t isCalibrating;
 } QTRSensors;
 
 /* ------------------------------------------------------------------ */
@@ -154,11 +156,6 @@ typedef struct {
  */
 void QTRSensors_init(QTRSensors *qtr);
 
-/**
- * @brief  Free calibration memory and reset runtime state.
- * @param  qtr  Initialised descriptor.
- */
-void QTRSensors_deinit(QTRSensors *qtr);
 
 /**
  * @brief  Erase calibration so the next calibrate call starts fresh.
